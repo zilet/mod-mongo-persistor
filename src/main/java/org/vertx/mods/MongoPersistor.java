@@ -16,15 +16,10 @@
 
 package org.vertx.mods;
 
-import com.mongodb.BasicDBObject;
-import com.mongodb.CommandResult;
-import com.mongodb.DB;
-import com.mongodb.DBCollection;
-import com.mongodb.DBCursor;
-import com.mongodb.DBObject;
+import com.mongodb.*;
 import com.mongodb.Mongo;
-import com.mongodb.WriteConcern;
-import com.mongodb.WriteResult;
+import com.mongodb.MongoOptions;
+import com.mongodb.ServerAddress;
 import com.mongodb.util.JSON;
 import org.vertx.java.busmods.BusModBase;
 import org.vertx.java.core.Handler;
@@ -44,15 +39,18 @@ import java.util.UUID;
  */
 public class MongoPersistor extends BusModBase implements Handler<Message<JsonObject>> {
 
-  private String address;
-  private String host;
-  private int port;
-  private String dbName;
-  private String username;
-  private String password;
+  protected String address;
+  protected String host;
+  protected int port;
+  protected String dbName;
+  protected String username;
+  protected String password;
 
-  private Mongo mongo;
-  private DB db;
+  protected boolean autoConnectRetry;
+  protected int socketTimeout;
+
+  protected Mongo mongo;
+  protected DB db;
 
   public void start() {
     super.start();
@@ -64,26 +62,40 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
     username = getOptionalStringConfig("username", null);
     password = getOptionalStringConfig("password", null);
 
+    autoConnectRetry = getOptionalBooleanConfig("autoConnectRetry", true);
+    socketTimeout = getOptionalIntConfig("socketTimeout", 60000);
+
+    boolean fake = getOptionalBooleanConfig("fake", false);
+
+    
     try {
-      mongo = new Mongo(host, port);
-      db = mongo.getDB(dbName);
-      if (username != null && password != null) {
-        db.authenticate(username, password.toCharArray());
-      }
-      eb.registerHandler(address, this);
-    } catch (UnknownHostException e) {
-      logger.error("Failed to connect to mongo server", e);
+     MongoOptions mongoOptions = new MongoOptions();
+     mongoOptions.autoConnectRetry = autoConnectRetry;
+     mongoOptions.socketTimeout = socketTimeout;
+
+     mongo = new Mongo(new ServerAddress(host, port), mongoOptions);
+
+     db = mongo.getDB(dbName);
+     if (username != null && password != null) {
+      db.authenticate(username, password.toCharArray());
     }
-  }
+  } catch (UnknownHostException e) {
+    logger.error("Failed to connect to mongo server", e);
+  } 
+  
 
-  public void stop() {
-    mongo.close();
-  }
+  eb.registerHandler(address, this);
+}
 
-  public void handle(Message<JsonObject> message) {
+public void stop() {
+  mongo.close();
+}
 
-    String action = message.body.getString("action");
+public void handle(Message<JsonObject> message) {
 
+  String action = message.body.getString("action");
+
+  try{
     if (action == null) {
       sendError(message, "action must be specified");
       return;
@@ -91,329 +103,334 @@ public class MongoPersistor extends BusModBase implements Handler<Message<JsonOb
 
     switch (action) {
       case "save":
-        doSave(message);
-        break;
+      doSave(message);
+      break;
       case "update":
-        doUpdate(message);
-        break;    
+      doUpdate(message);
+      break;    
       case "find":
-        doFind(message);
-        break;
+      doFind(message);
+      break;
       case "findone":
-        doFindOne(message);
-        break;
+      doFindOne(message);
+      break;
       case "delete":
-        doDelete(message);
-        break;
+      doDelete(message);
+      break;
       case "count":
-        doCount(message);
-        break;
+      doCount(message);
+      break;
       case "getCollections":
-        getCollections(message);
-        break;
+      getCollections(message);
+      break;
       case "collectionStats":
-        getCollectionStats(message);
-        break;
+      getCollectionStats(message);
+      break;
       case "command":
-        runCommand(message);
+      runCommand(message);
+      break;
       default:
-        sendError(message, "Invalid action: " + action);
-        return;
+      sendError(message, "Invalid action: " + action);
+      return;
     }
+  } catch (Exception e){
+    sendError(message, e.getMessage());
   }
+}
 
-  private void doSave(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-    if (collection == null) {
-      return;
-    }
-    JsonObject doc = getMandatoryObject("document", message);
-    if (doc == null) {
-      return;
-    }
-    String genID;
-    if (doc.getField("_id") == null) {
-      genID = UUID.randomUUID().toString();
-      doc.putString("_id", genID);
-    } else {
-      genID = null;
-    }
-    DBCollection coll = db.getCollection(collection);
-    DBObject obj = jsonToDBObject(doc);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
-    WriteResult res = coll.save(obj, writeConcern);
-    if (res.getError() == null) {
-      if (genID != null) {
-        JsonObject reply = new JsonObject();
-        reply.putString("_id", genID);
-        sendOK(message, reply);
-      } else {
-        sendOK(message);
-      }
-    } else {
-      sendError(message, res.getError());
-    }
+private void doSave(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
   }
-
-  private void doUpdate(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-    if (collection == null) {
-      return;
-    }
-    JsonObject criteriaJson = getMandatoryObject("criteria", message);
-    if (criteriaJson == null) {
-      return;
-    }
-    DBObject criteria = jsonToDBObject(criteriaJson);
-
-    JsonObject objNewJson =  getMandatoryObject("objNew", message);
-    if (objNewJson == null) {
-      return;
-    }
-    DBObject objNew = jsonToDBObject(objNewJson);
-    Boolean upsert =  message.body.getBoolean("upsert",false);
-    Boolean multi = message.body.getBoolean("multi",false);
-    DBCollection coll = db.getCollection(collection);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
-    if (writeConcern == null) {
-        writeConcern = db.getWriteConcern();
-    }
-    WriteResult res = coll.update(criteria, objNew, upsert, multi, writeConcern);
-    if (res.getError() == null) {
+  JsonObject doc = getMandatoryObject("document", message);
+  if (doc == null) {
+    return;
+  }
+  String genID;
+  if (doc.getField("_id") == null) {
+    genID = UUID.randomUUID().toString();
+    doc.putString("_id", genID);
+  } else {
+    genID = null;
+  }
+  DBCollection coll = db.getCollection(collection);
+  DBObject obj = jsonToDBObject(doc);
+  WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
+  if (writeConcern == null) {
+    writeConcern = db.getWriteConcern();
+  }
+  WriteResult res = coll.save(obj, writeConcern);
+  if (res.getError() == null) {
+    if (genID != null) {
       JsonObject reply = new JsonObject();
-      reply.putNumber("number", res.getN());
+      reply.putString("_id", genID);
       sendOK(message, reply);
     } else {
-      sendError(message, res.getError());
+      sendOK(message);
     }
+  } else {
+    sendError(message, res.getError());
+  }
+}
+
+private void doUpdate(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
+  }
+  JsonObject criteriaJson = getMandatoryObject("criteria", message);
+  if (criteriaJson == null) {
+    return;
+  }
+  DBObject criteria = jsonToDBObject(criteriaJson);
+
+  JsonObject objNewJson =  getMandatoryObject("objNew", message);
+  if (objNewJson == null) {
+    return;
+  }
+  DBObject objNew = jsonToDBObject(objNewJson);
+  Boolean upsert =  message.body.getBoolean("upsert",false);
+  Boolean multi = message.body.getBoolean("multi",false);
+  DBCollection coll = db.getCollection(collection);
+  WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
+  if (writeConcern == null) {
+    writeConcern = db.getWriteConcern();
+  }
+  WriteResult res = coll.update(criteria, objNew, upsert, multi, writeConcern);
+  if (res.getError() == null) {
+    JsonObject reply = new JsonObject();
+    reply.putNumber("number", res.getN());
+    sendOK(message, reply);
+  } else {
+    sendError(message, res.getError());
+  }
+}
+
+private void doFind(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
+  }
+  Integer limit = (Integer)message.body.getNumber("limit");
+  if (limit == null) {
+    limit = -1;
+  }
+  Integer skip = (Integer)message.body.getNumber("skip");
+  if(skip == null) {
+    skip = -1;
   }
 
-  private void doFind(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-    if (collection == null) {
-      return;
-    }
-    Integer limit = (Integer)message.body.getNumber("limit");
-    if (limit == null) {
-      limit = -1;
-    }
-    Integer skip = (Integer)message.body.getNumber("skip");
-    if(skip == null) {
-      skip = -1;
-    }
-
-    Integer batchSize = (Integer)message.body.getNumber("batch_size");
-    if (batchSize == null) {
-      batchSize = 100;
-    }
-    JsonObject matcher = getMandatoryObject("matcher", message);
-    if (matcher == null) {
-      return;
-    }
-    JsonObject keys = message.body.getObject("keys");
-    
-    Object sort = message.body.getField("sort");
-    DBCollection coll = db.getCollection(collection);
-    DBCursor cursor = (keys == null) ? 
-    			coll.find(jsonToDBObject(matcher)) : 
-    			coll.find(jsonToDBObject(matcher), jsonToDBObject(keys));
-    if(skip != -1) {
-        cursor.skip(skip);
-    }
-    if (limit != -1) {
-      cursor.limit(limit);
-    }
-    if (sort != null) {
-      cursor.sort(sortObjectToDBObject(sort));
-    }
-    sendBatch(message, cursor, batchSize);
+  Integer batchSize = (Integer)message.body.getNumber("batch_size");
+  if (batchSize == null) {
+    batchSize = 100;
   }
+  JsonObject matcher = getMandatoryObject("matcher", message);
+  if (matcher == null) {
+    return;
+  }
+  JsonObject keys = message.body.getObject("keys");
+  
+  Object sort = message.body.getField("sort");
+  DBCollection coll = db.getCollection(collection);
+  DBCursor cursor = (keys == null) ? 
+  coll.find(jsonToDBObject(matcher)) : 
+  coll.find(jsonToDBObject(matcher), jsonToDBObject(keys));
+  if(skip != -1) {
+    cursor.skip(skip);
+  }
+  if (limit != -1) {
+    cursor.limit(limit);
+  }
+  if (sort != null) {
+    cursor.sort(sortObjectToDBObject(sort));
+  }
+  sendBatch(message, cursor, batchSize);
+}
 
-  private DBObject sortObjectToDBObject(Object sortObj) {
-    if (sortObj instanceof JsonObject) {
+private DBObject sortObjectToDBObject(Object sortObj) {
+  if (sortObj instanceof JsonObject) {
       // Backwards compatability and a simpler syntax for single-property sorting
-      return jsonToDBObject((JsonObject) sortObj);
-    } else if (sortObj instanceof JsonArray) {
-      JsonArray sortJsonObjects = (JsonArray) sortObj;
-      DBObject sortDBObject = new BasicDBObject();
-      for (Object curSortObj : sortJsonObjects) {
-        if (!(curSortObj instanceof JsonObject)) {
-          throw new IllegalArgumentException("Cannot handle type "
-              + curSortObj.getClass().getSimpleName());
-        }
-
-        sortDBObject.putAll(((JsonObject) curSortObj).toMap());
+    return jsonToDBObject((JsonObject) sortObj);
+  } else if (sortObj instanceof JsonArray) {
+    JsonArray sortJsonObjects = (JsonArray) sortObj;
+    DBObject sortDBObject = new BasicDBObject();
+    for (Object curSortObj : sortJsonObjects) {
+      if (!(curSortObj instanceof JsonObject)) {
+        throw new IllegalArgumentException("Cannot handle type "
+          + curSortObj.getClass().getSimpleName());
       }
 
-      return sortDBObject;
-    } else {
-      throw new IllegalArgumentException("Cannot handle type " + sortObj.getClass().getSimpleName());
+      sortDBObject.putAll(((JsonObject) curSortObj).toMap());
     }
-  }
 
-  private void sendBatch(Message<JsonObject> message, final DBCursor cursor, final int max) {
-    int count = 0;
-    JsonArray results = new JsonArray();
-    while (cursor.hasNext() && count < max) {
-      DBObject obj = cursor.next();
-      String s = obj.toString();
-      JsonObject m = new JsonObject(s);
-      results.add(m);
-      count++;
-    }
-    if (cursor.hasNext()) {
-      JsonObject reply = createBatchMessage("more-exist", results);
+    return sortDBObject;
+  } else {
+    throw new IllegalArgumentException("Cannot handle type " + sortObj.getClass().getSimpleName());
+  }
+}
+
+private void sendBatch(Message<JsonObject> message, final DBCursor cursor, final int max) {
+  int count = 0;
+  JsonArray results = new JsonArray();
+  while (cursor.hasNext() && count < max) {
+    DBObject obj = cursor.next();
+    String s = obj.toString();
+    JsonObject m = new JsonObject(s);
+    results.add(m);
+    count++;
+  }
+  if (cursor.hasNext()) {
+    JsonObject reply = createBatchMessage("more-exist", results);
 
       // Set a timeout, if the user doesn't reply within 10 secs, close the cursor
-      final long timerID = vertx.setTimer(10000, new Handler<Long>() {
-        public void handle(Long timerID) {
-          container.getLogger().warn("Closing DB cursor on timeout");
-          try {
-            cursor.close();
-          } catch (Exception ignore) {
-          }
+    final long timerID = vertx.setTimer(10000, new Handler<Long>() {
+      public void handle(Long timerID) {
+        container.getLogger().warn("Closing DB cursor on timeout");
+        try {
+          cursor.close();
+        } catch (Exception ignore) {
         }
-      });
-
-      message.reply(reply, new Handler<Message<JsonObject>>() {
-        public void handle(Message<JsonObject> msg) {
-          vertx.cancelTimer(timerID);
-          // Get the next batch
-          sendBatch(msg, cursor, max);
-        }
-      });
-
-    } else {
-      JsonObject reply = createBatchMessage("ok", results);
-      message.reply(reply);
-      cursor.close();
-    }
-  }
-
-  private JsonObject createBatchMessage(String status, JsonArray results) {
-    JsonObject reply = new JsonObject();
-    reply.putArray("results", results);
-    reply.putString("status", status);
-    reply.putNumber("number", results.size());
-    return reply;
-  }
-
-  protected void sendMoreExist(String status, Message<JsonObject> message, JsonObject json) {
-    json.putString("status", status);
-    message.reply(json, new Handler<Message<JsonObject>>() {
-      public void handle(Message<JsonObject> msg) {
-
       }
     });
+
+
+    message.reply(reply, new Handler<Message<JsonObject>>() {
+      public void handle(Message<JsonObject> msg) {
+        vertx.cancelTimer(timerID);
+          // Get the next batch
+        sendBatch(msg, cursor, max);
+      }
+    });
+
+  } else {
+    JsonObject reply = createBatchMessage("ok", results);
+    message.reply(reply);
+    cursor.close();
   }
+}
 
-  private void doFindOne(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-    if (collection == null) {
-      return;
+private JsonObject createBatchMessage(String status, JsonArray results) {
+  JsonObject reply = new JsonObject();
+  reply.putArray("results", results);
+  reply.putString("status", status);
+  reply.putNumber("number", results.size());
+  return reply;
+}
+
+protected void sendMoreExist(String status, Message<JsonObject> message, JsonObject json) {
+  json.putString("status", status);
+  message.reply(json, new Handler<Message<JsonObject>>() {
+    public void handle(Message<JsonObject> msg) {
+
     }
-    JsonObject matcher = message.body.getObject("matcher");
-    JsonObject keys = message.body.getObject("keys");
-    DBCollection coll = db.getCollection(collection);
-    DBObject res;
-    if (matcher == null) {
-      res = keys != null ? coll.findOne(null, jsonToDBObject(keys)) : coll.findOne();
-    } else {
-      res = keys != null ? coll.findOne(jsonToDBObject(matcher), jsonToDBObject(keys)) : coll.findOne(jsonToDBObject(matcher));
-    }
-    JsonObject reply = new JsonObject();
-    if (res != null) {
-      String s = res.toString();
-      JsonObject m = new JsonObject(s);
-      reply.putObject("result", m);
-    }
-    sendOK(message, reply);
+  });
+}
+
+private void doFindOne(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
   }
-
-    private void doCount(Message<JsonObject> message) {
-        String collection = getMandatoryString("collection", message);
-        if (collection == null) {
-            return;
-        }
-        JsonObject matcher = message.body.getObject("matcher");
-        DBCollection coll = db.getCollection(collection);
-        long count;
-        if (matcher == null) {
-            count = coll.count();
-        } else {
-            count = coll.count(jsonToDBObject(matcher));
-        }
-        JsonObject reply = new JsonObject();
-        reply.putNumber("count", count);
-        sendOK(message, reply);
-    }
-
-  private void doDelete(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-    if (collection == null) {
-      return;
-    }
-    JsonObject matcher = getMandatoryObject("matcher", message);
-    if (matcher == null) {
-      return;
-    }
-    DBCollection coll = db.getCollection(collection);
-    DBObject obj = jsonToDBObject(matcher);
-    WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
-    if (writeConcern == null) {
-      writeConcern = db.getWriteConcern();
-    }
-    WriteResult res = coll.remove(obj, writeConcern);
-    int deleted = res.getN();
-    JsonObject reply = new JsonObject().putNumber("number", deleted);
-    sendOK(message, reply);
+  JsonObject matcher = message.body.getObject("matcher");
+  JsonObject keys = message.body.getObject("keys");
+  DBCollection coll = db.getCollection(collection);
+  DBObject res;
+  if (matcher == null) {
+    res = keys != null ? coll.findOne(null, jsonToDBObject(keys)) : coll.findOne();
+  } else {
+    res = keys != null ? coll.findOne(jsonToDBObject(matcher), jsonToDBObject(keys)) : coll.findOne(jsonToDBObject(matcher));
   }
-
-  private void getCollections(Message<JsonObject> message) {
-    JsonObject reply = new JsonObject();
-    reply.putArray("collections", new JsonArray(db.getCollectionNames()
-        .toArray()));
-    sendOK(message, reply);
+  JsonObject reply = new JsonObject();
+  if (res != null) {
+    String s = res.toString();
+    JsonObject m = new JsonObject(s);
+    reply.putObject("result", m);
   }
+  sendOK(message, reply);
+}
 
-  private void getCollectionStats(Message<JsonObject> message) {
-    String collection = getMandatoryString("collection", message);
-
-    if (collection == null) {
-      return;
-    }
-    
-    DBCollection coll = db.getCollection(collection);
-    CommandResult stats = coll.getStats();
-    
-    JsonObject reply = new JsonObject();
-    reply.putObject("stats", new JsonObject(stats.toString()));
-    sendOK(message, reply);
-
+private void doCount(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
   }
-
-  private void runCommand(Message<JsonObject> message) {
-    JsonObject reply = new JsonObject();
-    
-    String command = getMandatoryString("command", message);
-
-    if (command == null) {
-      return;
-    }
-    
-    CommandResult result = db.command(command);
-    
-    reply.putObject("result", new JsonObject(result.toString()));
-    sendOK(message, reply);
+  JsonObject matcher = message.body.getObject("matcher");
+  DBCollection coll = db.getCollection(collection);
+  long count;
+  if (matcher == null) {
+    count = coll.count();
+  } else {
+    count = coll.count(jsonToDBObject(matcher));
   }
+  JsonObject reply = new JsonObject();
+  reply.putNumber("count", count);
+  sendOK(message, reply);
+}
 
-  private DBObject jsonToDBObject(JsonObject object) {
-    String str = object.encode();
-    return (DBObject)JSON.parse(str);
+private void doDelete(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+  if (collection == null) {
+    return;
   }
+  JsonObject matcher = getMandatoryObject("matcher", message);
+  if (matcher == null) {
+    return;
+  }
+  DBCollection coll = db.getCollection(collection);
+  DBObject obj = jsonToDBObject(matcher);
+  WriteConcern writeConcern = WriteConcern.valueOf(getOptionalStringConfig("writeConcern",""));
+  if (writeConcern == null) {
+    writeConcern = db.getWriteConcern();
+  }
+  WriteResult res = coll.remove(obj, writeConcern);
+  int deleted = res.getN();
+  JsonObject reply = new JsonObject().putNumber("number", deleted);
+  sendOK(message, reply);
+}
+
+private void getCollections(Message<JsonObject> message) {
+  JsonObject reply = new JsonObject();
+  reply.putArray("collections", new JsonArray(db.getCollectionNames()
+    .toArray()));
+  sendOK(message, reply);
+}
+
+private void getCollectionStats(Message<JsonObject> message) {
+  String collection = getMandatoryString("collection", message);
+
+  if (collection == null) {
+    return;
+  }
+  
+  DBCollection coll = db.getCollection(collection);
+  CommandResult stats = coll.getStats();
+  
+  JsonObject reply = new JsonObject();
+  reply.putObject("stats", new JsonObject(stats.toString()));
+  sendOK(message, reply);
+
+}
+
+private void runCommand(Message<JsonObject> message) {
+  JsonObject reply = new JsonObject();
+  
+  String command = getMandatoryString("command", message);
+
+  if (command == null) {
+    return;
+  }
+  
+  CommandResult result = db.command(command);
+  
+  reply.putObject("result", new JsonObject(result.toString()));
+  sendOK(message, reply);
+}
+
+private DBObject jsonToDBObject(JsonObject object) {
+  String str = object.encode();
+  return (DBObject)JSON.parse(str);
+}
 
 }
 
